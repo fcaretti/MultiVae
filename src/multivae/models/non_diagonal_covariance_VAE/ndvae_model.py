@@ -45,16 +45,60 @@ class NDVAE(BaseMultiVAE):
         self.K = model_config.K
         self.prior_rank = model_config.prior_rank
         
-
+        self.modalities_specific_dim = model_config.modalities_specific_dim
+        self.total_latent_dim = sum(
+            sum(dim) if isinstance(dim, list) else dim for dim in self.modalities_specific_dim.values()
+        )
         self.prior_mean = torch.nn.Parameter(
-            torch.zeros(1, self.latent_dim), requires_grad=False
+            torch.zeros(1, self.total_latent_dim), requires_grad=False
         )
         self.w = torch.nn.Parameter(
-            torch.randn(self.latent_dim, self.prior_rank), requires_grad=True
+            torch.randn(self.total_latent_dim, self.prior_rank), requires_grad=True
         )
-        self.diag_variance = torch.nn.Parameter(
-            torch.randn(1, self.latent_dim), requires_grad=True
+        '''self.diag_variance = torch.nn.Parameter(
+            torch.randn(1, self.total_latent_dim), requires_grad=True
+        )'''
+
+        self.diag_variance_unconstrained = torch.nn.Parameter(
+            torch.randn(1, self.total_latent_dim), requires_grad=True
         )
+        #self.diag_variance = torch.nn.functional.softplus(self.diag_variance_unconstrained).to(self.w.device)
+        self.reconstruction_loss = {}
+        
+        for modality, dist in model_config.decoders_dist.items():
+            # Retrieve additional parameters for the distribution, if any
+            dist_params = model_config.decoder_dist_params.get(modality, {})
+
+            # Define the appropriate loss function based on distribution type
+            if dist == 'normal':
+                # Normal distribution reconstruction loss (mean squared error)
+                scale = dist_params.get('scale', 1.0)  # default scale if none specified
+                self.reconstruction_loss[modality] = lambda x_recon, x_true: \
+                    0.5 * ((x_recon - x_true) / scale) ** 2
+
+            elif dist == 'bernoulli':
+                # Bernoulli distribution reconstruction loss (binary cross-entropy)
+                self.reconstruction_loss[modality] = lambda x_recon, x_true: \
+                    F.binary_cross_entropy_with_logits(x_recon, x_true, reduction='none')
+
+            elif dist == 'laplace':
+                # Laplace distribution reconstruction loss (mean absolute error)
+                scale = dist_params.get('scale', 1.0)  # default scale if none specified
+                self.reconstruction_loss[modality] = lambda x_recon, x_true: \
+                    torch.abs(x_recon - x_true) / scale
+            else:
+                raise ValueError(f"Unknown decoder distribution '{dist}' for modality '{modality}'")
+
+        # Set up rescaling factors if using likelihood rescaling
+        if model_config.uses_likelihood_rescaling:
+            self.rescale_factors = model_config.rescale_factors or self._compute_rescale_factors(model_config)
+        else:
+            self.rescale_factors = {modality: 1.0 for modality in model_config.input_dims}
+
+    def _compute_rescale_factors(self, model_config):
+        # Default rescale factors based on input dimensions for each modality
+        total_dim = sum([torch.prod(torch.tensor(dim)).item() for dim in model_config.input_dims.values()])
+        return {modality: total_dim / torch.prod(torch.tensor(dim)).item() for modality, dim in model_config.input_dims.items()}
 
         self.model_name = "NDVAE"
 
@@ -63,195 +107,108 @@ class NDVAE(BaseMultiVAE):
         Generate the covariance matrix of the prior distribution from the parameters
         Parameterization ensures that the covariance matrix is positive definite.
         """
-        return torch.mm(self.w, self.w.t()) + torch.diag(self.diag_variance)
+        #print the devices
+        device = self.w.device
+        diag_variance = torch.nn.functional.softplus(self.diag_variance_unconstrained).to(device) 
+        return torch.mm(self.w, self.w.t()) + torch.diag(diag_variance) + torch.eye(self.w.size(0), device=device) * 1e-3
 
-    #not needed, as we work directly with the covariance matrix
-    """def log_var_to_std(self, log_var):
 
-        if self.model_config.prior_and_posterior_dist == "laplace_with_softmax":
-            return F.softmax(log_var, dim=-1) * log_var.size(-1) + 1e-6
-        else:
-            return torch.exp(0.5 * log_var)"""
-    # not needed, as we work directly with the covariance matrix
-    """@property
-    def pz_params(self):
-        ""From the prior mean and log_covariance, return the mean and standard
-        deviation, either applying softmax or not depending on the choice of prior
-        distribution.
-
-        Returns:
-            tuple: mean, std
-        ""
-        mean = self.prior_mean
-        if self.model_config.prior_and_posterior_dist == "laplace_with_softmax":
-            std = (
-                F.softmax(self.prior_log_var, dim=-1) * self.prior_log_var.size(-1)
-                + 1e-6
-            )
-        else:
-            std = torch.exp(0.5 * self.prior_log_var)
-        return mean, std"""
-
-    def forward(self, inputs: MultimodalBaseDataset, **kwargs):
-        # TODO : maybe implement a minibatch strategy for stashing the gradients before
-        # backpropagation when using a large number k.
-        # Also, I've only implemented the dreg_looser loss but it may be nice to offer other options.
-
-        # First compute all the encodings for all modalities
-
-        # drop modalities that are completely unavailable in the batch to avoid Nan in backward
-        inputs = drop_unused_modalities(inputs)
-
+    def forward(self, inputs, **kwargs):
+        # Initialize dictionaries to store embeddings and other necessary data
         embeddings = {}
-        qz_xs = {}
-        qz_xs_detach = {}
-        reconstructions = {}
+        embeddings_list = []
+        latent_dims = {}
+        modalities = list(inputs.data.keys())
 
-        compute_loss = kwargs.pop("compute_loss", True)
-        detailed_output = kwargs.pop("detailed_output", False)
-        K = kwargs.pop("K", self.K)
+        # Compute embeddings for each modality
+        for mod in modalities:
+            x = inputs.data[mod]
+            # Pass data through the encoder (projects onto a single variable)
+            z = self.encoders[mod](x).embedding  # Shape: (batch_size, latent_dim_mod)
+            embeddings[mod] = z
+            embeddings_list.append(z)
+            latent_dims[mod] = z.size(1)
 
-        for cond_mod in inputs.data:
-            output = self.encoders[cond_mod](inputs.data[cond_mod])
-            z = output.embedding
+        # Concatenate embeddings from all modalities along the feature dimension
+        # Resulting shape: (batch_size, latent_dim_total)
+        z_stacked = torch.cat(embeddings_list, dim=1)
+        latent_dim_total = z_stacked.size(1)
 
-            # Then compute all the cross-modal reconstructions
-            reconstructions[cond_mod] = {}
-            for recon_mod in inputs.data:
-                decoder = self.decoders[recon_mod]
-                z = z.reshape(-1, z.shape[-1])  # (K*n_batch, latent_dim)
-                recon = decoder(z)["reconstruction"]
-                recon = recon.reshape((*z.shape[:-1], *recon.shape[1:]))
-                reconstructions[cond_mod][recon_mod] = recon
+        # Prepare the output object to store embeddings and other necessary data
+        output = ModelOutput()
+        output.embeddings = embeddings
+        output.z_stacked = z_stacked
+        output.latent_dims = latent_dims
+        output.modalities = modalities
+        output.inputs = inputs
 
-            qz_xs[cond_mod] = qz_x
-            embeddings[cond_mod] = z_x
-            qz_xs_detach[cond_mod] = qz_x_detach
-
-        # Compute DREG loss
+        # Compute loss if specified
+        compute_loss = kwargs.get('compute_loss', True)
         if compute_loss:
-            loss_output = self.dreg_looser(
-                qz_xs_detach, embeddings, reconstructions, inputs
-            )
+            loss_output = self.loss_function(output)
+            output.update(loss_output)
 
-        else:
-            loss_output = ModelOutput()
-        if detailed_output:
-            loss_output["qz_xs"] = qz_xs
-            loss_output["qz_xs_detach"] = qz_xs_detach
-            loss_output["zss"] = embeddings
-            loss_output["recon"] = reconstructions
+        return output
+
+    def loss_function(self, output):
+        # Retrieve necessary variables from the output of the forward pass
+        z_stacked = output.z_stacked  # (batch_size, latent_dim_total)
+        latent_dims = output.latent_dims
+        embeddings = output.embeddings
+        inputs = output.inputs
+        modalities = output.modalities
+
+        # Generate the covariance matrix for the prior distribution
+        prior_covariance = self.generate_covariance_prior()  # Shape: (latent_dim_total, latent_dim_total)
+        condition_number = torch.linalg.cond(prior_covariance)
+        # Ensure the covariance matrix has the correct dimensions
+        latent_dim_total = z_stacked.size(1)
+        if prior_covariance.size() != (latent_dim_total, latent_dim_total):
+            raise ValueError("The generated covariance matrix has incorrect dimensions.")
+
+        # Create the prior distribution with mean zero and generated covariance
+        prior_mean = torch.zeros(latent_dim_total, device=z_stacked.device)
+        prior_dist = torch.distributions.MultivariateNormal(
+            loc=prior_mean, covariance_matrix=prior_covariance
+        )
+
+        # Compute the negative log-likelihood (equivalent to KL divergence)
+        # Since embeddings are deterministic, KL divergence simplifies to -log_prob
+        negative_log_likelihood = -prior_dist.log_prob(z_stacked)  # Shape: (batch_size)
+        total_kl_divergence = negative_log_likelihood.sum()
+        #print(total_kl_divergence)
+
+        # Initialize variables for reconstructions and total reconstruction loss
+        reconstructions = {}
+        reconstruction_loss = 0
+
+        # Separate the latent space back into modality-specific components
+        current_index = 0
+        for mod in modalities:
+            latent_dim_mod = latent_dims[mod]
+            # Extract the corresponding component from the stacked latent space
+            z_mod = z_stacked[:, current_index:current_index + latent_dim_mod]  # (batch_size, latent_dim_mod)
+            current_index += latent_dim_mod
+
+            # Decode the latent embeddings to reconstruct the input
+            x_recon = self.decoders[mod](z_mod)['reconstruction']
+            reconstructions[mod] = x_recon
+
+            # Compute reconstruction loss for the modality
+            x_true = inputs.data[mod]
+            rec_loss_mod = self.reconstruction_loss[mod](x_recon, x_true)
+            reconstruction_loss += rec_loss_mod.sum()
+
+        # Sum the KL divergence and reconstruction loss to obtain the total loss
+        total_loss = total_kl_divergence + reconstruction_loss
+
+        # Return the total loss encapsulated in a ModelOutput object
+        loss_output = ModelOutput(loss=total_loss, metrics=dict())
+        loss_output.reconstructions = reconstructions
 
         return loss_output
-    
-    def loss_function(self, embeddings, reconstructions, inputs):
-        if hasattr(inputs, "masks"):
-            # Compute the number of available modalities per sample
-            n_mods_sample = torch.sum(
-                torch.stack(tuple(inputs.masks.values())).int(), dim=0
-            )
-        else:
-            n_mods_sample = torch.tensor([self.n_modalities])
 
-        lws = []
-        zss = []
-        for mod in embeddings:
-            z = embeddings[mod]
 
-    def dreg_looser(self, qz_xs, embeddings, reconstructions, inputs):
-        if hasattr(inputs, "masks"):
-            # Compute the number of available modalities per sample
-            n_mods_sample = torch.sum(
-                torch.stack(tuple(inputs.masks.values())).int(), dim=0
-            )
-        else:
-            n_mods_sample = torch.tensor([self.n_modalities])
-
-        lws = []
-        zss = []
-        for mod in embeddings:
-            z = embeddings[mod]  # (K, n_batch, latent_dim)
-            n_mods_sample = n_mods_sample.to(z.device)
-            prior = self.prior_dist(*self.pz_params)
-            lpz = prior.log_prob(z).sum(-1)
-
-            if hasattr(inputs, "masks"):
-                lqz_x = []
-                for m in qz_xs:
-                    qz = qz_xs[m].log_prob(z).sum(-1)
-                    qz[torch.stack([inputs.masks[m] == False] * len(z))] = -torch.inf
-                    lqz_x.append(qz)
-
-                lqz_x = torch.stack(lqz_x)  # n_modalities,K,nbatch
-            else:
-                lqz_x = torch.stack(
-                    [qz_xs[m].log_prob(z).sum(-1) for m in qz_xs]
-                )  # n_modalities,K,nbatch
-
-            lqz_x = torch.logsumexp(lqz_x, dim=0) - torch.log(
-                n_mods_sample
-            )  # log_mean_exp
-            lpx_z = 0
-            for recon_mod in reconstructions[mod]:
-                x_recon = reconstructions[mod][recon_mod]
-                K, n_batch = x_recon.shape[0], x_recon.shape[1]
-                lpx_z_mod = (
-                    self.recon_log_probs[recon_mod](x_recon, inputs.data[recon_mod])
-                    .view(K, n_batch, -1)
-                    .mul(self.rescale_factors[recon_mod])
-                    .sum(-1)
-                )
-
-                if hasattr(inputs, "masks"):
-                    # cancel unavailable modalities
-                    lpx_z_mod *= inputs.masks[recon_mod].float()
-
-                lpx_z += lpx_z_mod
-
-            lw = lpx_z + lpz - lqz_x
-
-            if hasattr(inputs, "masks"):
-                # cancel unavailable modalities
-                lw *= inputs.masks[mod].float()
-
-            lws.append(lw)
-            zss.append(z)
-
-        lws = torch.stack(lws)  # (n_modalities, K, n_batch)
-        zss = torch.stack(zss)  # (n_modalities, K, n_batch,latent_dim)
-        with torch.no_grad():
-            grad_wt = (lws - torch.logsumexp(lws, 1, keepdim=True)).exp()
-            if zss.requires_grad:  # True except when we are in eval mode
-                zss.register_hook(lambda grad: grad_wt.unsqueeze(-1) * grad)
-
-        lws = (grad_wt * lws).sum(0) / n_mods_sample  # mean over modalities
-
-        return ModelOutput(loss=-lws.mean(-1).sum(), metrics=dict())
-
-    def iwae(self, qz_xs, zss, reconstructions, inputs):
-        lw_mod = []
-        for cond_mod in zss:
-            lpz = self.prior_dist(*self.pz_params).log_prob(zss[cond_mod]).sum(-1)
-            lqz_x = torch.stack(
-                [qz_xs[m].log_prob(zss[cond_mod]).sum(-1) for m in qz_xs]
-            )
-            lqz_x = torch.logsumexp(lqz_x, dim=0) - np.log(lqz_x.size(0))
-            lpx_z = 0
-            for recon_mod in reconstructions[cond_mod]:
-                x_recon = reconstructions[cond_mod][recon_mod]
-                K, n_batch = x_recon.shape[0], x_recon.shape[1]
-                lpx_z += (
-                    self.recon_log_probs[recon_mod](x_recon, inputs.data[recon_mod])
-                    .view(K, n_batch, -1)
-                    .mul(self.rescale_factors[recon_mod])
-                    .sum(-1)
-                )
-            lw = lpx_z + lpz - lqz_x  # n_samples , n_batch
-            lw_mod.append(lw)
-
-        lw = torch.cat(lw_mod, dim=0)  # (n_modalities* K, n_batch)
-        lw = torch.logsumexp(lw, dim=0) - np.log(lw.size(0))
-        return ModelOutput(loss=-lw.sum(), metrics=dict())
 
     def encode(
         self,

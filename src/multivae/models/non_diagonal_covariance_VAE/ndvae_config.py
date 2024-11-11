@@ -45,4 +45,5 @@ class NDVAEConfig(BaseMultiVAEConfig):
     )
     learn_prior: bool = True
     beta: float = 1.0"""
+    modalities_specific_dim: dict = None
     prior_rank: int = 10
