@@ -317,3 +317,121 @@ class MVAE(BaseMultiVAE):
             ll += torch.logsumexp(torch.Tensor(lnpxs), dim=0) - np.log(K)
 
         return -ll
+
+
+    @torch.no_grad()
+    def compute_conditional_nll(
+        self,
+        inputs: Union[MultimodalBaseDataset, IncompleteDataset],
+        cond_mod: Union[list, tuple, str],
+        target_mod: Union[list, tuple, str] = "all",
+        K: int = 1000,
+        batch_size_K: int = 100,
+    ):
+        """Estimate the negative conditional log-likelihood of a target set of modalities
+        given a conditioning subset.
+
+        Args:
+            inputs (MultimodalBaseDataset): a batch of samples.
+            cond_mod (Union[list, tuple, str]): The conditioning set of modalities. Can be:
+                - a list/tuple of modality names, or
+                - 'all' to condition on all available modalities.
+            target_mod (Union[list, tuple, str]): The target set whose likelihood is evaluated. Can be:
+                - a list/tuple of modality names,
+                - 'all' to evaluate all modalities,
+                - 'rest' (default) to evaluate the complement of `cond_mod`.
+            K (int): Number of importance samples. Default: 1000.
+            batch_size_K (int): Mini-batch size along the K samples. Default: 100.
+
+        Returns:
+            The negative conditional log-likelihood summed over the batch
+        """
+        # Ensure eval mode and completeness (same constraint as compute_joint_nll)
+        self.eval()
+        if hasattr(inputs, "masks"):
+            raise AttributeError(
+                "The compute_conditional_nll method is not implemented for incomplete datasets."
+            )
+
+        # Normalize conditioning set
+        if isinstance(cond_mod, str):
+            if cond_mod == "all":
+                cond_set = list(self.encoders.keys())
+            else:
+                cond_set = [cond_mod]
+        else:
+            cond_set = list(cond_mod)
+
+        if len(cond_set) == 0:
+            raise ValueError("cond_mod must contain at least one modality.")
+
+        # Normalize target set
+        all_mods = list(inputs.data.keys())
+        if isinstance(target_mod, str):
+            if target_mod == "rest":
+                target_set = [m for m in all_mods if m not in cond_set]
+            elif target_mod == "all":
+                target_set = all_mods
+            else:
+                target_set = [target_mod]
+        else:
+            target_set = list(target_mod)
+
+        if len(target_set) == 0:
+            raise ValueError(
+                "target_mod resolves to an empty set. "
+                "Choose a non-empty target set or use 'all'/'rest'."
+            )
+
+        # Compute q(z | x_C)
+        mu, log_var = self.compute_mu_log_var_subset(inputs, cond_set)
+        sigma = torch.exp(0.5 * log_var)
+        qz_xc = dist.Normal(mu, sigma)
+
+        # Sample K latents from the conditional posterior: (n_data, K, latent_dim)
+        z_samples = qz_xc.rsample([K]).permute(1, 0, 2)
+        n_data, _, _ = z_samples.shape
+
+        ll = 0  # accumulate log-likelihood over the batch
+
+        for i in range(n_data):
+            start_idx = 0
+            stop_idx = min(start_idx + batch_size_K, K)
+            ln_terms = []
+
+            while start_idx < stop_idx:
+                latents = z_samples[i][start_idx:stop_idx]  # (bK, latent_dim)
+
+                # Sum log p(x_m | z) over target modalities
+                lpx_t_z = 0
+                for mod in target_set:
+                    decoder = self.decoders[mod]
+                    recon = decoder(latents)["reconstruction"]  # (bK, ...)
+                    x_m = inputs.data[mod][i]
+                    lpx_t_z += (
+                        self.recon_log_probs[mod](
+                            recon, torch.stack([x_m] * len(recon))
+                        )
+                        .reshape(recon.size(0), -1)
+                        .sum(-1)
+                    )
+
+                # Prior and proposal terms
+                prior = dist.Normal(0, 1)
+                lpz = prior.log_prob(latents).sum(dim=-1)
+
+                qz_xc_i = dist.Normal(mu[i], sigma[i])
+                lqz_xc = qz_xc_i.log_prob(latents).sum(dim=-1)
+
+                # IWAE log-weight and log-sum-exp over this chunk
+                ln_terms.append(torch.logsumexp(lpx_t_z + lpz - lqz_xc, dim=0))
+
+                # Next chunk of K
+                start_idx += batch_size_K
+                stop_idx = min(stop_idx + batch_size_K, K)
+
+            # Aggregate across chunks, then across K
+            ll += torch.logsumexp(torch.stack(ln_terms), dim=0) - np.log(K)
+
+        # Return negative conditional log-likelihood summed over the batch
+        return -ll

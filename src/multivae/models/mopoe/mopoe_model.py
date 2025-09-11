@@ -715,3 +715,140 @@ class MoPoE(BaseMultiVAE):
         return self._compute_joint_nll_from_subset_encoding(
             entire_subset, inputs, K, batch_size_K
         )
+
+
+    @torch.no_grad()
+    def compute_conditional_nll(
+        self,
+        inputs: Union[MultimodalBaseDataset, IncompleteDataset],
+        cond_mod: Union[list, tuple, str],
+        target_mod: Union[list, tuple, str] = "all",
+        K: int = 1000,
+        batch_size_K: int = 100,
+    ):
+        """Estimate the negative conditional log-likelihood.
+
+        Based on the standard implementation, not the paper one.
+
+        Returns:
+            The negative conditional log-likelihood summed over the batch.
+        """
+        # Only complete datasets supported here (same constraint as joint_nll)
+        self.eval()
+        if hasattr(inputs, "masks"):
+            raise AttributeError(
+                "The compute_conditional_nll method is not yet implemented for incomplete datasets."
+            )
+
+        # --- Resolve C (conditioning set) ---
+        if isinstance(cond_mod, str):
+            if cond_mod == "all":
+                C = list(self.encoders.keys())
+            else:
+                C = [cond_mod]
+        else:
+            C = list(cond_mod)
+        if len(C) == 0:
+            raise ValueError("cond_mod must contain at least one modality.")
+
+        # --- Resolve T (target set) ---
+        all_mods = list(inputs.data.keys())
+        if isinstance(target_mod, str):
+            if target_mod == "rest":
+                T = [m for m in all_mods if m not in C]
+            elif target_mod == "all":
+                T = all_mods
+            else:
+                T = [target_mod]
+        else:
+            T = list(target_mod)
+        if len(T) == 0:
+            raise ValueError("target_mod resolves to an empty set.")
+
+        # --- Subset PoE posterior for shared latent: q(z | x_C) ---
+        infer = self.inference(inputs)
+        subset_key = "_".join(sorted(C))
+        if subset_key not in infer["subsets"]:
+            raise KeyError(f"Unknown subset key for conditioning: {subset_key}")
+        mu_shared_C, logvar_shared_C = infer["subsets"][subset_key]
+        sigma_shared_C = torch.exp(0.5 * logvar_shared_C)
+        qz_xc = dist.Normal(mu_shared_C, sigma_shared_C)
+
+        # Sample shared z: (n_data, K, latent_dim)
+        z_shared = qz_xc.rsample([K]).permute(1, 0, 2)
+        n_data, _, _ = z_shared.shape
+
+        # --- Private latents (only if multiple latent spaces, and only for targets T) ---
+        private_params = {}
+        private_zs = {}
+        if self.multiple_latent_spaces:
+            for mod in T:
+                mu_p = infer["modalities"][mod].style_embedding
+                logvar_p = infer["modalities"][mod].style_log_covariance
+                private_params[mod] = (mu_p, logvar_p)
+                z_p = rsample_from_gaussian(mu_p, logvar_p, N=K)  # (K, n_data, d_m)
+                private_zs[mod] = z_p.permute(1, 0, 2)  # (n_data, K, d_m)
+
+        # Standard Normal prior(s)
+        std_normal = dist.Normal(0.0, 1.0)
+
+        # --- IWAE over datapoints with chunking on K ---
+        ll = 0
+        for i in range(n_data):
+            start_idx = 0
+            stop_idx = min(start_idx + batch_size_K, K)
+            ln_terms = []
+
+            while start_idx < stop_idx:
+                shared_latents = z_shared[i][start_idx:stop_idx]  # (bK, d)
+
+                # Likelihood over targets
+                lpx_t_z = 0
+                # Prior and proposal parts
+                lpz = std_normal.log_prob(shared_latents).sum(dim=-1)  # p(z)
+                lq = dist.Normal(mu_shared_C[i], sigma_shared_C[i]).log_prob(
+                    shared_latents
+                ).sum(dim=-1)  # q(z | x_C)
+
+                for mod in T:
+                    if self.multiple_latent_spaces:
+                        # private latent for this modality
+                        priv_latents = private_zs[mod][i][start_idx:stop_idx]  # (bK, dm)
+                        full_embedding = torch.cat([shared_latents, priv_latents], dim=-1)
+                    else:
+                        full_embedding = shared_latents
+
+                    # log p(x_m | z, (z_m))
+                    decoder = self.decoders[mod]
+                    recon = decoder(full_embedding)["reconstruction"]  # (bK, ...)
+                    x_m = inputs.data[mod][i]
+                    lpx_t_z += (
+                        self.recon_log_probs[mod](
+                            recon, torch.stack([x_m] * len(recon))
+                        )
+                        .reshape(recon.size(0), -1)
+                        .sum(-1)
+                    )
+
+                    # private priors/posteriors terms if applicable
+                    if self.multiple_latent_spaces:
+                        lpz += std_normal.log_prob(priv_latents).sum(dim=-1)  # p(z_m)
+                        qz_m = dist.Normal(
+                            private_params[mod][0][i],
+                            torch.exp(0.5 * private_params[mod][1][i]),
+                        )
+                        lq += qz_m.log_prob(priv_latents).sum(dim=-1)  # q(z_m | x_m)
+
+                # IWAE log-weight for this chunk
+                ln_terms.append(torch.logsumexp(lpx_t_z + lpz - lq, dim=0))
+
+                # Next chunk of K
+                start_idx += batch_size_K
+                stop_idx = min(stop_idx + batch_size_K, K)
+
+            # Aggregate across chunks then across K
+            ll += torch.logsumexp(torch.stack(ln_terms), dim=0) - np.log(K)
+
+        # Negative conditional log-likelihood, summed over the batch
+        return -ll
+
